@@ -44,4 +44,4 @@ Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangep
 
 ## License
 
-MIT license ([LICENSE](https://github.com/vitali2y/simple-opirv2-router/LICENSE) or <http://opensource.org/licenses/MIT>)
+MIT license ([LICENSE](https://github.com/vitali2y/simple-opirv2-router/blob/main/LICENSE) or <http://opensource.org/licenses/MIT>)
