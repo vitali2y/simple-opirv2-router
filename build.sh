@@ -10,252 +10,239 @@
 
 set -e
 
-echo "simple wired/WiFi router setup..."
+# configuration
+WIFI_SSID="${WIFI_SSID:-opi}"
+WIFI_PASSWORD="${WIFI_PASSWORD:-$(dd if=/dev/urandom bs=12 count=1 2>/dev/null | base64 | cut -c1-12)}"
+IMG_NAME="irradium-opi-router.img"
+ROOT_MNT="/mnt/irradium-root"
 
-# predefined mandatory local files
-IMG="irradium-3.8-riscv64-core-orange_pi_rv2-6.17.6-build-20251102.img"
-KERNEL_PKG="kernel-k1#6.17.9-1.pkg.tar.gz"
-FW_PKG="kernel-firmware-k1#6.17.9-1.pkg.tar.gz"
+echo "Building Orange Pi RV2 router..."
 
-WIFI_SSID="${WIFI_SSID:-OPI-RV2-Router}"
-WIFI_PASSWORD="${WIFI_PASSWORD:-ChangeMe123!}"
-
-BOOT_MNT="/mnt/opi-boot"
-ROOT_MNT="/mnt/opi-root"
+# ensure prerequisites
+command -v wget >/dev/null || { echo "wget required"; exit 1; }
+command -v zstd >/dev/null || { echo "zstd required"; exit 1; }
+command -v losetup >/dev/null || { echo "losetup required"; exit 1; }
 
 # check binaries
 REQUIRED_BINS=("busybox" "iw" "hostapd" "dnsmasq")
 for bin in "${REQUIRED_BINS[@]}"; do
-  if [ ! -f "$bin" ]; then
-    echo "required binary '$bin' not found!"
+  if [ ! -f "utils/$bin" ]; then
+    echo "Not found required binary '$bin' in 'utils' dir!"
     exit 1
   fi
 done
-echo "all required binaries found"
 
-echo "mounting Irradium image..."
-LOOP=$(sudo losetup -f --show "$IMG")
-sudo partprobe "$LOOP"
-sudo mkdir -p "$BOOT_MNT" "$ROOT_MNT"
-sudo mount "${LOOP}p1" "$BOOT_MNT"
-sudo mount "${LOOP}p2" "$ROOT_MNT"
+# managing distro/kernel/firmware
+mkdir -p distribs && cd distribs >/dev/null
 
-# ensure serial console is enabled for debugging
-echo "ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100" sudo tee -a "$ROOT_MNT/etc/inittab"
+# download kernel/firmware
+REQUIRED_PKGS=("kernel-k1#6.17.9-1.pkg.tar.gz" "kernel-firmware-k1#6.17.9-1.pkg.tar.gz")
+for pkg in "${REQUIRED_PKGS[@]}"; do
+  if [ ! -f "$pkg" ]; then
+    echo "Downloading $pkg..."
+    wget --quiet --no-check-certificate \
+      "https://dl.irradium.org/irradium/images/orange_pi_rv2/kernel/$pkg"
+  fi
+done
 
-echo "upgrading to kernel 6.17.9..."
-sudo tar -xf "$KERNEL_PKG" -C "$ROOT_MNT"
-sudo tar -xf "$FW_PKG" -C "$ROOT_MNT"
-sudo cp "$ROOT_MNT/boot/Image" "$BOOT_MNT/"
-sudo cp -r "$ROOT_MNT/boot/dtbs" "$BOOT_MNT/" 2>/dev/null || true
+# download base image if missing
+BASE_IMG="irradium-3.8-riscv64-core-orange_pi_rv2-6.17.6-build-20251102.img"
+if [ ! -f "$BASE_IMG.zst" ]; then
+  echo "Downloading Irradium OS image..."
+  wget --quiet --no-check-certificate \
+    https://dl.irradium.org/irradium/images/orange_pi_rv2/"$BASE_IMG.zst"
+fi
 
-echo "embedding prebuilt binaries..."
+cd - >/dev/null
+
+echo "Preparing image..."
+rm $IMG_NAME
+zstd -d "distribs/$BASE_IMG.zst" -o $IMG_NAME 2>/dev/null
+
+# create output image
+LOOP_DEV=$(sudo losetup --find --show --partscan "$IMG_NAME")
+sudo partprobe "$LOOP_DEV"
+sleep 2
+
+# mount root partition
+ROOT_PART="${LOOP_DEV}p2"
+sudo mkdir -p "$ROOT_MNT"
+sudo mount "$ROOT_PART" "$ROOT_MNT"
+trap 'sudo umount "$ROOT_MNT" 2>/dev/null; sudo losetup -d "$LOOP_DEV" 2>/dev/null; rmdir "$ROOT_MNT" 2>/dev/null' EXIT
+
+# install kernel & firmware
+echo "Installing kernel and firmware..."
+for pkg in "${REQUIRED_PKGS[@]}"; do
+  sudo tar -xf "distribs/$pkg" -C "$ROOT_MNT" --exclude=.[^/]*
+done
+
+echo "Embedding prebuilt utils..."
 sudo cp ./utils/{busybox,iw,hostapd,dnsmasq} "$ROOT_MNT/usr/local/bin/"
 sudo chmod +x "$ROOT_MNT/usr/local/bin/"{busybox,iw,hostapd,dnsmasq}
 sudo ln -sf busybox "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo chmod +x "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo mkdir -p "$ROOT_MNT/var/lib/misc"
 
-# composing network init script
-echo "network magic..."
+# inject SSH authorized key
+echo "Setting up SSH access..."
+sudo mkdir -p "$ROOT_MNT/root/.ssh"
+USER=$(env | grep LOGNAME | cut -d'=' -f2)
+if [ -f /home/$USER/.ssh/id_rsa.pub ]; then
+  sudo cp /home/$USER/.ssh/id_rsa.pub "$ROOT_MNT/root/.ssh/authorized_keys"
+elif [ -f /home/$USER/.ssh/id_ed25519.pub ]; then
+  sudo cp /home/$USER/.ssh/id_ed25519.pub "$ROOT_MNT/root/.ssh/authorized_keys"
+else
+  echo "WARNING: No SSH public key found - you won't be able to SSH in!"
+  sudo touch "$ROOT_MNT/root/.ssh/authorized_keys"
+fi
+sudo chmod 700 "$ROOT_MNT/root/.ssh"
+sudo chmod 600 "$ROOT_MNT/root/.ssh/authorized_keys"
 
-# udhcpc default script (required for route/DNS setup)
-sudo mkdir -p "$ROOT_MNT/etc/udhcpc"
-cat <<'EOF' | sudo tee "$ROOT_MNT/etc/udhcpc/default.script" >/dev/null
+# set fallback DNS
+echo "nameserver 8.8.8.8" | sudo tee "$ROOT_MNT/etc/resolv.conf" > /dev/null
+
+# udhcpc script (with onlink)
+cat <<'EOF' | sudo tee "$ROOT_MNT/etc/udhcpc.script" >/dev/null
 #!/bin/sh
-[ -z "$1" ] && echo "error: should be called from udhcpc" && exit 1
 case "$1" in
-    deconfig)
-        /sbin/ifconfig $interface 0.0.0.0
-        ;;
-    renew|bound)
-        /sbin/ifconfig $interface $ip netmask $subnet
-        if [ -n "$router" ]; then
-            # clear existing default routes
-            while ip route del default dev $interface 2>/dev/null; do :; done
-            # add new default route
-            for i in $router; do
-                ip route add default via $i dev $interface
-            done
-        fi
-        echo -n > /etc/resolv.conf
-        [ -n "$domain" ] && echo "search $domain" >> /etc/resolv.conf
-        for i in $dns; do
-            echo "nameserver $i" >> /etc/resolv.conf
-        done
-        ;;
+  bound|renew)
+    ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.255}"
+    ip route replace default via "$router" dev "$interface" onlink
+    echo "nameserver $dns" > /etc/resolv.conf
+    ;;
+  deconfig)
+    ifconfig "$interface" 0.0.0.0
+    ip route flush dev "$interface" 2>/dev/null
+    ;;
 esac
 EOF
-sudo chmod +x "$ROOT_MNT/etc/udhcpc/default.script"
+sudo chmod +x "$ROOT_MNT/etc/udhcpc.script"
 
+# composing WiFi AP script
+cat <<'EOF' | sudo tee "$ROOT_MNT/usr/local/bin/wifi-ap" >/dev/null
+#!/bin/sh
+case "$1" in
+  start)
+    echo "wifi-ap: loading brcmfmac..."
+    modprobe brcmfmac
+    sleep 10
+
+    # Wait for wlan0
+    for i in $(seq 1 25); do
+      if ip link show wlan0 >/dev/null 2>&1; then
+        echo "wifi-ap: wlan0 detected"
+        break
+      fi
+      sleep 2
+    done
+
+    if ! ip link show wlan0 >/dev/null 2>&1; then
+      echo "ERROR: wlan0 never appeared!" >&2
+      exit 1
+    fi
+
+    # Configure interface
+    ip link set wlan0 up
+    ip addr add 192.168.12.1/24 dev wlan0 2>/dev/null || true
+
+    # Kill stale processes
+    killall hostapd dnsmasq 2>/dev/null || true
+    sleep 2
+
+    # Start AP and DHCP (ONLY NOW)
+    echo "wifi-ap: starting hostapd..."
+    /usr/local/bin/hostapd -B /etc/hostapd.conf >/dev/null 2>&1
+
+    echo "wifi-ap: starting dnsmasq..."
+    /usr/local/bin/dnsmasq \
+      --interface=wlan0 \
+      --dhcp-range=192.168.12.50,192.168.12.150,12h \
+      --no-daemon \
+      --log-queries \
+      >/dev/null 2>&1 &
+
+    echo "wifi-ap: ready"
+    ;;
+  stop)
+    killall hostapd dnsmasq 2>/dev/null || true
+    ip link set wlan0 down 2>/dev/null || true
+    ;;
+esac
+EOF
+sudo chmod +x "$ROOT_MNT/usr/local/bin/wifi-ap"
+
+# network service
 cat <<'EOF' | sudo tee "$ROOT_MNT/etc/rc.d/net" >/dev/null
 #!/bin/sh
-case $1 in
-start)
-  # wait for eth0
-  while ! ip link show eth0 >/dev/null 2>&1; do sleep 1; done
-  ip link set eth0 up
+start() {
+  # Loopback
+  ip addr add 127.0.0.1/8 dev lo 2>/dev/null
+  ip link set lo up
 
-  # get WAN IP
-  if /usr/local/bin/udhcpc -t 3 -T 2 -i eth0 -s /etc/udhcpc/default.script; then
-    echo "WAN: DHCP lease obtained"
-  else
-    /usr/local/bin/udhcpc -i eth2 -s /etc/udhcpc/default.script
-  fi
-
-  echo "nameserver 8.8.8.8" > /etc/resolv.conf
-
-  # LAN: eth1 (static IP + DHCP)
+  # LAN (eth1)
+  ip addr add 192.168.10.1/24 dev eth1 2>/dev/null
   ip link set eth1 up
-  ip addr add 192.168.10.1/24 dev eth1
-  mkdir -p /var/lib/misc
-  WIFI_SUBNET="${WIFI_SUBNET:-192.168.12}"
-  LAN_SUBNET="${LAN_SUBNET:-192.168.10}"
 
-  # kill any running instance
-  killall dnsmasq 2>/dev/null || true
+  # Start AP
+  /usr/local/bin/wifi-ap start &
 
-  # start with explicit binding and upstream DNS
-  /usr/local/bin/dnsmasq \
-    --interface=eth1 \
-    --interface=wlan0 \
-    --listen-address=192.168.10.1 \
-    --listen-address=192.168.12.1 \
-    --dhcp-range=wlan0,${WIFI_SUBNET}.50,${WIFI_SUBNET}.150,12h \
-    --dhcp-range=eth1,${LAN_SUBNET}.50,${LAN_SUBNET}.150,12h \
-    --dhcp-option=wlan0,option:dns-server,${WIFI_SUBNET}.1 \
-    --dhcp-option=eth1,option:dns-server,${LAN_SUBNET}.1 \
-    --no-resolv \
-    --server=8.8.8.8 \
-    --server=1.1.1.1 \
-    --no-hosts \
-    --bind-interfaces
-#    --no-daemon \
-#    --log-queries \
-#    --log-facility=/var/log/dnsmasq.log
+  # WAN (eth0)
+  ip link set eth0 up
+  sleep 2
+  /usr/local/bin/udhcpc -i eth0 -s /etc/udhcpc.script -t 3 -T 5 -A 3 >/dev/null 2>&1 &
 
-  # enable forwarding
+  # Enable forwarding
   echo 1 > /proc/sys/net/ipv4/ip_forward
-  echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-  # load NAT
-  nft -f /etc/nftables.conf
-  ;;
-stop)
-  killall udhcpc dnsmasq-static 2>/dev/null || true
-  ip addr flush dev eth0 2>/dev/null || true
-  ip addr flush dev eth1 2>/dev/null || true
-  ;;
-esac
+  # nftables: filter + NAT
+  nft add table inet filter 2>/dev/null || true
+  nft flush table inet filter
+  nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
+  nft add rule inet filter forward ct state established,related accept
+  nft add rule inet filter forward ip saddr 192.168.10.0/24 ip daddr 192.168.12.0/24 accept
+  nft add rule inet filter forward ip saddr 192.168.12.0/24 ip daddr 192.168.10.0/24 accept
+  nft add rule inet filter forward ip saddr { 192.168.10.0/24, 192.168.12.0/24 } oifname "eth0" accept
+  nft add rule inet filter forward ip saddr { 192.168.10.0/24, 192.168.12.0/24 } accept
+
+  # Masquerade
+  nft add table ip nat 2>/dev/null || true
+  nft flush table ip nat
+  nft add chain ip nat postrouting '{ type nat hook postrouting priority 100; }'
+  nft add rule ip nat postrouting oifname "eth0" masquerade
+
+  echo "Network started"
+}
+stop() {
+  killall udhcpc hostapd dnsmasq wifi-ap 2>/dev/null || true
+  ip link set eth0 down 2>/dev/null
+  ip link set eth1 down 2>/dev/null
+  ip link set wlan0 down 2>/dev/null
+
+  echo "Network stopped"
+}
+case "$1" in start) start ;; stop) stop ;; restart) stop; sleep 2; start ;; *) echo "Usage: $0 {start|stop|restart}" ;; esac
 EOF
 sudo chmod +x "$ROOT_MNT/etc/rc.d/net"
 
-# composing WiFi AP script
-cat <<'EOF' | sudo tee "$ROOT_MNT/etc/rc.d/wifi-ap" >/dev/null
-#!/bin/sh
-case $1 in
-start)
-  modprobe brcmfmac
-  sleep 5
-
-  # wait indefinitely for wlan0 (critical for SDIO)
-  while ! ip link show wlan0 >/dev/null 2>&1; do
-    echo "wifi-ap: waiting for wlan0..."
-    sleep 5
-  done
-
-  # configure interface
-  ip link set wlan0 down 2>/dev/null || true
-  sleep 2
-  ip link set wlan0 up
-  ip addr add 192.168.12.1/24 dev wlan0
-
-  # kill stale processes
-  killall dnsmasq hostapd 2>/dev/null || true
-  sleep 2
-
-  # start services
-  /usr/local/bin/hostapd -B /etc/hostapd.conf
-  /usr/local/bin/dnsmasq --interface=wlan0 --dhcp-range=192.168.12.50,192.168.12.150,12h
-  ;;
-stop)
-  killall hostapd dnsmasq 2>/dev/null || true
-  ip addr flush wlan0 2>/dev/null || true
-  ;;
-esac
-EOF
-sudo chmod +x "$ROOT_MNT/etc/rc.d/wifi-ap"
-
-# hostapd config
-cat <<EOF | sudo tee "$ROOT_MNT/etc/hostapd.conf" >/dev/null
+# write WiFi config
+sudo tee "$ROOT_MNT/etc/hostapd.conf" <<EOF >/dev/null
 interface=wlan0
-driver=nl80211
-ssid=${WIFI_SSID}
+ssid=$WIFI_SSID
 hw_mode=g
 channel=6
+auth_algs=1
 wpa=2
-wpa_passphrase=${WIFI_PASSWORD}
+wpa_passphrase=$WIFI_PASSWORD
 wpa_key_mgmt=WPA-PSK
+wpa_pairwise=TKIP
 rsn_pairwise=CCMP
 EOF
 
-# nftables NAT rules
-cat <<'EOF' | sudo tee "$ROOT_MNT/etc/nftables.conf" >/dev/null
-flush ruleset
-table nat {
-  chain postrouting {
-    type nat hook postrouting priority 100;
-    oifname "eth0" masquerade
-  }
-}
-table inet filter {
-  chain forward {
-    type filter hook forward priority 0;
-    iifname "wlan0" oifname "eth0" accept
-    iifname "eth0" oifname "wlan0" ct state related,established accept
-    iifname "eth1" oifname "eth0" accept
-    iifname "eth0" oifname "eth1" ct state related,established accept
-  }
-}
-EOF
-
-# auto-load nftables at boot
-echo "nft -f /etc/nftables.conf" | sudo tee -a "$ROOT_MNT/etc/rc.d/net"
-
-# SSH hardening
-cat <<EOF | sudo tee "$ROOT_MNT/etc/ssh/sshd_config" >/dev/null
-Port 22
-Protocol 2
-PermitRootLogin prohibit-password
-PasswordAuthentication no
-PubkeyAuthentication yes
-AuthorizedKeysFile .ssh/authorized_keys
-ChallengeResponseAuthentication no
-UsePAM yes
-X11Forwarding no
-PrintMotd no
-TCPKeepAlive yes
-AcceptEnv LANG LC_*
-Subsystem sftp /usr/lib/ssh/sftp-server
-EOF
-
-# generate host keys
-sudo chroot "$ROOT_MNT" /bin/sh -c "ssh-keygen -A" 2>/dev/null || true
-
-# enabling services
-if ! grep -q "net wifi-ap" "$ROOT_MNT/etc/rc.conf"; then
-  sudo sed -i '/^SERVICES=/ s/)$/ net wifi-ap)/' "$ROOT_MNT/etc/rc.conf"
-fi
-
-# cleaning up
-sync
-sudo umount "$BOOT_MNT" "$ROOT_MNT"
-sudo losetup -d "$LOOP"
-sudo rmdir "$BOOT_MNT" "$ROOT_MNT"
-
 echo "SSID: $WIFI_SSID"
-echo "gateway: 192.168.10.1"
-echo "SD image: $IMG"
-echo "burn it (where <usb_sd_dev> is: /dev/sda or /dev/mmcblk0 - check carefully!) as:  sudo dd if=$IMG of=<usb_sd_dev> bs=1M && sync"
-echo "or (on Linux Mint) as:  mintstick -m format && mintstick -m iso && sync"
-echo "done!"
+echo "WiFi password: $WIFI_PASSWORD"
+echo "Gateway: 192.168.10.1"
+echo "SD image: $IMG_NAME"
+echo "Burn it (where <usb_sd_dev> is: /dev/sda or /dev/mmcblk0 - check carefully!) as:  sudo dd if=$IMG_NAME of=<usb_sd_dev> bs=1M && sync"
+echo "or (on Linux Mint) as:  mintstick -m format && mintstick -m iso -i $IMG_NAME && sync"
+echo "or balenaEtcher"
+echo "Done!"

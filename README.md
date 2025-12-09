@@ -4,19 +4,7 @@ Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangep
 
 ## Installation
 
-1. Download and unpack `Irradium OS`:
-   ```shell
-   wget --no-check-certificate https://dl.irradium.org/irradium/images/orange_pi_rv2/irradium-3.8-riscv64-core-orange_pi_rv2-6.17.6-build-20251102.img.zst
-   zstd -d irradium-3.8-riscv64-core-orange_pi_rv2-6.17.6-build-20251102.img.zst   
-   ```
-
-1. Download Irradium kernel and firmware:
-   ```shell
-   wget --no-check-certificate 'https://dl.irradium.org/irradium/images/orange_pi_rv2/kernel/kernel-firmware-k1#6.17.9-1.pkg.tar.gz'
-   wget --no-check-certificate 'https://dl.irradium.org/irradium/images/orange_pi_rv2/kernel/kernel-k1#6.17.9-1.pkg.tar.gz'
-   ```
-
-1. Prepare image in single command:
+1. Prepare image by single command:
    ```shell
    ./build.sh
    ```
@@ -26,16 +14,16 @@ Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangep
    WIFI_SSID="MyRouter" WIFI_PASSWORD="SuperSecret!" ./build.sh
    ```
 
-1. Format 16GB+ SD Card and burn image produced above:
+1. Format 16GB+ SD Card and burn image generated above by next one-liner:
    ```shell
-   ➜ mintstick -m format && mintstick -m iso && sync
+   mintstick -m format && mintstick -m iso -i irradium-opi-router.img && sync
    ```
 
 1. Insert SD Card into SBC.
 
-   Connect host's (LAN) cable to router's `end1` (left from top) port.
+   Connect host's (LAN) cable to router's `eth1` (left from top) port.
 
-   Connect Internet (WAN) cable to another router's `end0` (right from top) port.
+   Connect Internet (WAN) cable to another router's `eth0` (right from top) port.
 
    Power on.
 
