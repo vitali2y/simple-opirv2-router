@@ -1,4 +1,6 @@
-# Simple home WiFi/wired router @ Orange Pi RV2 SBC
+# Minimal home WiFi/wired router @ Orange Pi RV2 SBC
+
+<img src="doc/opi_rv2_painting.png" alt="Orange Pi RV2 painting" style="width:300px;"/>
 
 Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangepiwiki/index.php/Orange_Pi_RV2) SBC device as a home WiFi and wired router running on [Irradium OS](https://irradium.org/) (based on `CRUX` distribution), in few steps.
 
@@ -21,14 +23,37 @@ Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangep
 
 1. Insert SD Card into SBC.
 
-   Connect host's (LAN) cable to router's `eth1` (left from top) port.
+   Connect your computer to the left from top Ethernet port (`eth1`, LAN: `192.168.10.1`).
 
-   Connect Internet (WAN) cable to another router's `eth0` (right from top) port.
+   Connect your ISP modem to the right from top Ethernet port (`eth0`, WAN).
 
    Power on.
 
-   Done!
+1. Wired clients require static IP configuration.
 
+   On your host configure `DHCP` manually.
+   * Under `Network Manager`:
+     * Method: *Manual*,
+     * Address: *192.168.10.10*,
+     * Netmask: *24*,
+     * Gateway: *192.168.10.1*,
+     * DNS: *192.168.10.1,8.8.8.8*.
+
+   * Or, just from CLI (my example below):
+   ```shell
+   sudo ip addr add 192.168.10.10/24 dev enp130s0         # set static IP in LAN subnet
+   sudo ip route add default via 192.168.10.1             # set SBC as a default gateway
+   echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf  # set DNS
+   ```
+
+   WiFi clients receive IP, gateway, and DNS automatically via `DHCP`.
+
+1.  You can always SSH to your new `Orange Pi RV2` router from host box (optional):
+    ```shell
+    ➜ ssh root@192.168.10.1
+    ```
+
+   Done!
 
 ## License
 

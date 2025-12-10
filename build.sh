@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Preparing Irradium 3.8 OS image for running Orange Pi RV2 SBC as a simple wired/WiFi router
+# Preparing Irradium OS image for running Orange Pi RV2 SBC as a minimal home wired/WiFi router
 
 # Usage:
 # * with default SSID/password as:
@@ -130,7 +130,10 @@ case "$1" in
     # Wait for wlan0
     for i in $(seq 1 25); do
       if ip link show wlan0 >/dev/null 2>&1; then
-        echo "wifi-ap: wlan0 detected"
+        echo "wifi-ap: wlan0 detected — waiting for firmware readiness..."
+        sleep 8
+        ip link set wlan0 up
+        ip addr add 192.168.12.1/24 dev wlan0 || true
         break
       fi
       sleep 2
@@ -152,7 +155,6 @@ case "$1" in
     # Start AP and DHCP (ONLY NOW)
     echo "wifi-ap: starting hostapd..."
     /usr/local/bin/hostapd -B /etc/hostapd.conf >/dev/null 2>&1
-
     echo "wifi-ap: starting dnsmasq..."
     /usr/local/bin/dnsmasq \
       --interface=wlan0 \
@@ -171,6 +173,38 @@ esac
 EOF
 sudo chmod +x "$ROOT_MNT/usr/local/bin/wifi-ap"
 
+cat <<'EOF' | sudo tee "$ROOT_MNT/etc/rc.d/wifi" >/dev/null
+#!/bin/sh
+start() {
+  # Wait for SDIO and load driver
+  timeout=0
+  while [ $timeout -lt 60 ]; do
+    if ls /sys/bus/sdio/devices/ 2>/dev/null | grep -q "mmc"; then
+      echo "wifi: SDIO detected, loading brcmfmac..."
+      modprobe brcmfmac 2>/dev/null || true
+      break
+    fi
+    sleep 2
+    timeout=$((timeout + 2))
+  done
+
+  # Wait for wlan0
+  timeout=0
+  while [ $timeout -lt 30 ]; do
+    if ip link show wlan0 >/dev/null 2>&1; then
+      echo "wifi: wlan0 ready, starting AP"
+      /usr/local/bin/wifi-ap start
+      return 0
+    fi
+    sleep 2
+    timeout=$((timeout + 2))
+  done
+  echo "wifi: timeout" >&2
+}
+case "$1" in start) start ;; esac
+EOF
+sudo chmod +x "$ROOT_MNT/etc/rc.d/wifi"
+
 # network service
 cat <<'EOF' | sudo tee "$ROOT_MNT/etc/rc.d/net" >/dev/null
 #!/bin/sh
@@ -182,9 +216,6 @@ start() {
   # LAN (eth1)
   ip addr add 192.168.10.1/24 dev eth1 2>/dev/null
   ip link set eth1 up
-
-  # Start AP
-  /usr/local/bin/wifi-ap start &
 
   # WAN (eth0)
   ip link set eth0 up
@@ -237,6 +268,9 @@ wpa_key_mgmt=WPA-PSK
 wpa_pairwise=TKIP
 rsn_pairwise=CCMP
 EOF
+
+# adding wifi service to services
+sudo sed -i '/^SERVICES=/ s/)$/ wifi)/' "$ROOT_MNT/etc/rc.conf"
 
 echo "SSID: $WIFI_SSID"
 echo "WiFi password: $WIFI_PASSWORD"
