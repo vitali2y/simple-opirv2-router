@@ -1,7 +1,8 @@
 #!/bin/bash
 
+#
 # Preparing Irradium OS image for running Orange Pi RV2 SBC as a minimal home wired/WiFi router
-
+#
 # Usage:
 # * with default SSID/password as:
 #   ./build.sh
@@ -16,7 +17,7 @@ WIFI_PASSWORD="${WIFI_PASSWORD:-$(dd if=/dev/urandom bs=12 count=1 2>/dev/null |
 IMG_NAME="irradium-opi-router.img"
 ROOT_MNT="/mnt/irradium-root"
 
-echo "Building Orange Pi RV2 router..."
+echo "Building Orange Pi RV2 WiFi/wired router..."
 
 # ensure prerequisites
 command -v wget >/dev/null || { echo "wget required"; exit 1; }
@@ -24,7 +25,7 @@ command -v zstd >/dev/null || { echo "zstd required"; exit 1; }
 command -v losetup >/dev/null || { echo "losetup required"; exit 1; }
 
 # check binaries
-REQUIRED_BINS=("busybox" "iw" "hostapd" "dnsmasq")
+REQUIRED_BINS=("busybox" "iw" "hostapd" "dnsmasq" "powerkey")
 for bin in "${REQUIRED_BINS[@]}"; do
   if [ ! -f "utils/$bin" ]; then
     echo "Not found required binary '$bin' in 'utils' dir!"
@@ -77,11 +78,16 @@ for pkg in "${REQUIRED_PKGS[@]}"; do
 done
 
 echo "Embedding prebuilt utils..."
-sudo cp ./utils/{busybox,iw,hostapd,dnsmasq} "$ROOT_MNT/usr/local/bin/"
-sudo chmod +x "$ROOT_MNT/usr/local/bin/"{busybox,iw,hostapd,dnsmasq}
+sudo cp ./utils/{busybox,iw,hostapd,dnsmasq,powerkey} "$ROOT_MNT/usr/local/bin/"
+sudo chmod +x "$ROOT_MNT/usr/local/bin/"{busybox,iw,hostapd,dnsmasq,powerkey}
 sudo ln -sf busybox "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo chmod +x "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo mkdir -p "$ROOT_MNT/var/lib/misc"
+
+# configure fsck to auto-repair of second root partition
+echo "/dev/mmcblk0p2 / ext4 defaults 0 1" | sudo tee "$ROOT_MNT/etc/fstab"
+# enable automatic repair
+echo 'FSCKFIX=yes' | sudo tee -a "$ROOT_MNT/etc/rc.conf"
 
 # inject SSH authorized key
 echo "Setting up SSH access..."
@@ -97,6 +103,50 @@ else
 fi
 sudo chmod 700 "$ROOT_MNT/root/.ssh"
 sudo chmod 600 "$ROOT_MNT/root/.ssh/authorized_keys"
+
+# Generate strong SSH host keys (ed25519 + rsa)
+echo "Generating SSH host keys..."
+sudo ssh-keygen -t ed25519 -f "$ROOT_MNT/etc/ssh/ssh_host_ed25519_key" -N "" -q
+sudo ssh-keygen -t rsa -b 4096 -f "$ROOT_MNT/etc/ssh/ssh_host_rsa_key" -N "" -q
+sudo chmod 600 "$ROOT_MNT/etc/ssh/ssh_host_"*"_key"
+sudo chmod 644 "$ROOT_MNT/etc/ssh/ssh_host_"*"_key.pub"
+
+sudo tee "$ROOT_MNT/etc/ssh/sshd_config" <<'EOF' >/dev/null
+# Protocol
+Port 22
+Protocol 2
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+# Authentication
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+
+# Security
+UsePAM yes
+PrintMotd no
+PrintLastLog no
+TCPKeepAlive no
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+GatewayPorts no
+PermitTunnel no
+PermitUserEnvironment no
+Compression no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Logging
+LogLevel VERBOSE
+
+# Subsystem
+Subsystem sftp internal-sftp
+EOF
 
 # set fallback DNS
 echo "nameserver 8.8.8.8" | sudo tee "$ROOT_MNT/etc/resolv.conf" > /dev/null
@@ -156,12 +206,15 @@ case "$1" in
     echo "wifi-ap: starting hostapd..."
     /usr/local/bin/hostapd -B /etc/hostapd.conf >/dev/null 2>&1
     echo "wifi-ap: starting dnsmasq..."
-    /usr/local/bin/dnsmasq \
-      --interface=wlan0 \
-      --dhcp-range=192.168.12.50,192.168.12.150,12h \
-      --no-daemon \
-      --log-queries \
-      >/dev/null 2>&1 &
+/usr/local/bin/dnsmasq \
+    --interface=wlan0 \
+    --listen-address=192.168.12.1 \
+    --bind-interfaces \
+    --dhcp-range=192.168.12.50,192.168.12.150,12h \
+    --dhcp-option=3,192.168.12.1 \
+    --dhcp-option=6,192.168.12.1 \
+    --no-daemon \
+    --log-queries &
 
     echo "wifi-ap: ready"
     ;;
@@ -201,7 +254,10 @@ start() {
   done
   echo "wifi: timeout" >&2
 }
-case "$1" in start) start ;; esac
+stop() {
+  killall hostapd dnsmasq 2>/dev/null
+}
+case "$1" in start) start ;; stop) stop ;; restart) stop; sleep 2; start ;; *) echo "Usage: "$0" {start|stop|restart}" ;; esac
 EOF
 sudo chmod +x "$ROOT_MNT/etc/rc.d/wifi"
 
@@ -228,6 +284,37 @@ start() {
   # nftables: filter + NAT
   nft add table inet filter 2>/dev/null || true
   nft flush table inet filter
+
+  # Input filter: only allow SSH from LAN, block everything from WAN
+
+  # Create an 'input' chain that inspects packets destined TO the router itself
+  nft add chain inet filter input '{ type filter hook input priority 0; policy drop; }'
+
+  # Allow packets that are part of an already established or related connection (e.g., replies to outbound DNS/HTTP)
+  nft add rule inet filter input ct state established,related accept
+
+  # Allow all traffic on the loopback interface (required for local services)
+  nft add rule inet filter input iifname "lo" accept
+
+  # Allow DHCP requests from wired clients (UDP port 67) so they can get an IP
+  nft add rule inet filter input iifname "eth1" udp dport 67 accept
+
+  # Allow DNS queries from wired clients (UDP port 53) so they can resolve domain names
+  nft add rule inet filter input iifname "eth1" udp dport 53 accept
+
+  # Allow SSH access from wired clients (TCP port 22) for administration
+  nft add rule inet filter input iifname "eth1" tcp dport 22 accept
+
+  # Allow DHCP requests from WiFi clients (UDP port 67)
+  nft add rule inet filter input iifname "wlan0" udp dport 67 accept
+
+  # Allow DNS queries from WiFi clients (UDP port 53) — critical for Internet access
+  nft add rule inet filter input iifname "wlan0" udp dport 53 accept
+
+  # Allow SSH access from WiFi clients (TCP port 22)
+  nft add rule inet filter input iifname "wlan0" tcp dport 22 accept
+
+  # Forward chain
   nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
   nft add rule inet filter forward ct state established,related accept
   nft add rule inet filter forward ip saddr 192.168.10.0/24 ip daddr 192.168.12.0/24 accept
@@ -251,7 +338,7 @@ stop() {
 
   echo "Network stopped"
 }
-case "$1" in start) start ;; stop) stop ;; restart) stop; sleep 2; start ;; *) echo "Usage: $0 {start|stop|restart}" ;; esac
+case "$1" in start) start ;; stop) stop ;; restart) stop; sleep 2; start ;; *) echo "Usage: "$0" {start|stop|restart}" ;; esac
 EOF
 sudo chmod +x "$ROOT_MNT/etc/rc.d/net"
 
@@ -269,9 +356,33 @@ wpa_pairwise=TKIP
 rsn_pairwise=CCMP
 EOF
 
-# adding wifi service to services
-sudo sed -i '/^SERVICES=/ s/)$/ wifi)/' "$ROOT_MNT/etc/rc.conf"
+# shutdown upon short press on power on/off button
+cat <<'EOF' | sudo tee "$ROOT_MNT/etc/rc.d/powerkey" >/dev/null
+#!/bin/sh
+# Init script for powerkey daemon
+case "$1" in
+  start)
+    echo "Starting powerkey daemon..."
+    /usr/local/bin/powerkey &
+    echo "Powerkey started"
+    ;;
+  stop)
+    echo "Stopping powerkey daemon..."
+    killall powerkey 2>/dev/null || true
+    echo "Powerkey stopped"
+    ;;
+  *)
+    echo "Usage: "$0" {start|stop}"
+    exit 1
+esac
+exit 0
+EOF
+sudo chmod +x "$ROOT_MNT/etc/rc.d/powerkey"
 
+# adding wifi + powerkey services
+sudo sed -i '/^SERVICES=/ s/)$/ wifi powerkey)/' "$ROOT_MNT/etc/rc.conf"
+
+echo
 echo "SSID: $WIFI_SSID"
 echo "WiFi password: $WIFI_PASSWORD"
 echo "Gateway: 192.168.10.1"

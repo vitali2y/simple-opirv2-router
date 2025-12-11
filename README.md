@@ -2,7 +2,7 @@
 
 <img src="doc/opi_rv2_painting.png" alt="Orange Pi RV2 painting" style="width:300px;"/>
 
-Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangepiwiki/index.php/Orange_Pi_RV2) SBC device as a home WiFi and wired router running on [Irradium OS](https://irradium.org/) (based on `CRUX` distribution), in few steps.
+Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangepiwiki/index.php/Orange_Pi_RV2) SBC device as a home WiFi and wired router running on [Irradium OS](https://irradium.org/) (based on `CRUX` distribution), in few steps. Secure by default and suitable for internet exposure.
 
 ## Installation
 
@@ -48,7 +48,7 @@ Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangep
 
    WiFi clients receive IP, gateway, and DNS automatically via `DHCP`.
 
-1.  You can always SSH to your new `Orange Pi RV2` router from host box (optional):
+1.  You can always SSH to your new `Orange Pi RV2` router from host box without password (optional):
     ```shell
     ➜ ssh root@192.168.10.1
     ```
