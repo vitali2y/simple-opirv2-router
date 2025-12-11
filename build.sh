@@ -8,16 +8,18 @@
 #   ./build.sh
 # * with custom SSID/password as:
 #   WIFI_SSID="MyRouter" WIFI_PASSWORD="SuperSecret!" ./build.sh
+#
 
 set -e
 
 # configuration
+VER=0.4.0
 WIFI_SSID="${WIFI_SSID:-opi}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-$(dd if=/dev/urandom bs=12 count=1 2>/dev/null | base64 | cut -c1-12)}"
 IMG_NAME="irradium-opi-router.img"
 ROOT_MNT="/mnt/irradium-root"
 
-echo "Building Orange Pi RV2 WiFi/wired router..."
+echo "Building Orange Pi RV2 WiFi/wired router (v$VER)..."
 
 # ensure prerequisites
 command -v wget >/dev/null || { echo "wget required"; exit 1; }
