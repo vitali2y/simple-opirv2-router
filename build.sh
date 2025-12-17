@@ -13,7 +13,7 @@
 set -e
 
 # configuration
-VER=0.4.0
+VER=0.5.0
 WIFI_SSID="${WIFI_SSID:-opi}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-$(dd if=/dev/urandom bs=12 count=1 2>/dev/null | base64 | cut -c1-12)}"
 IMG_NAME="irradium-opi-router.img"
@@ -59,7 +59,7 @@ fi
 cd - >/dev/null
 
 echo "Preparing image..."
-rm $IMG_NAME
+rm $IMG_NAME 2>/dev/null || true
 zstd -d "distribs/$BASE_IMG.zst" -o $IMG_NAME 2>/dev/null
 
 # create output image
@@ -86,10 +86,16 @@ sudo ln -sf busybox "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo chmod +x "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo mkdir -p "$ROOT_MNT/var/lib/misc"
 
-# configure fsck to auto-repair of second root partition
-echo "/dev/mmcblk0p2 / ext4 defaults 0 1" | sudo tee "$ROOT_MNT/etc/fstab"
-# enable automatic repair
-echo 'FSCKFIX=yes' | sudo tee -a "$ROOT_MNT/etc/rc.conf"
+# append time-sync logic
+sudo tee "$ROOT_MNT/etc/rc.local" <<'EOF' >/dev/null
+
+# Sync system time early in boot
+if rdate -s time.nist.gov; then
+  echo "System clock updated"
+else
+  rdate -s pool.ntp.org 2>/dev/null && echo "Fallback time sync succeeded"
+fi
+EOF
 
 # inject SSH authorized key
 echo "Setting up SSH access..."
@@ -106,7 +112,7 @@ fi
 sudo chmod 700 "$ROOT_MNT/root/.ssh"
 sudo chmod 600 "$ROOT_MNT/root/.ssh/authorized_keys"
 
-# Generate strong SSH host keys (ed25519 + rsa)
+# generate strong SSH host keys (ed25519 + rsa)
 echo "Generating SSH host keys..."
 sudo ssh-keygen -t ed25519 -f "$ROOT_MNT/etc/ssh/ssh_host_ed25519_key" -N "" -q
 sudo ssh-keygen -t rsa -b 4096 -f "$ROOT_MNT/etc/ssh/ssh_host_rsa_key" -N "" -q
@@ -204,7 +210,7 @@ case "$1" in
     killall hostapd dnsmasq 2>/dev/null || true
     sleep 2
 
-    # Start AP and DHCP (ONLY NOW)
+    # Start AP and DHCP
     echo "wifi-ap: starting hostapd..."
     /usr/local/bin/hostapd -B /etc/hostapd.conf >/dev/null 2>&1
     echo "wifi-ap: starting dnsmasq..."
@@ -213,6 +219,7 @@ case "$1" in
     --listen-address=192.168.12.1 \
     --bind-interfaces \
     --dhcp-range=192.168.12.50,192.168.12.150,12h \
+    --dhcp-leasefile=/run/misc/dnsmasq.leases \
     --dhcp-option=3,192.168.12.1 \
     --dhcp-option=6,192.168.12.1 \
     --no-daemon \
@@ -383,6 +390,75 @@ sudo chmod +x "$ROOT_MNT/etc/rc.d/powerkey"
 
 # adding wifi + powerkey services
 sudo sed -i '/^SERVICES=/ s/)$/ wifi powerkey)/' "$ROOT_MNT/etc/rc.conf"
+
+# set valid root password to bypass PAM first-login enforcement
+DAYS_SINCE_EPOCH=$(( $(date +%s) / 86400 ))
+
+# generate random password and hash
+ROOT_PASS="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | base64 | tr -d '+/=' | cut -c1-16)"
+PASS_HASH=$(openssl passwd -6 "$ROOT_PASS")
+
+# update /etc/shadow with proper fields
+sudo sed -i "s|^root:[^:]*:.*|root:$PASS_HASH:$DAYS_SINCE_EPOCH:0:99999:7:::|" "$ROOT_MNT/etc/shadow"
+
+# enable passwordless root auto-login on ttyS0
+sudo sed -i 's|^s1:2:respawn:/sbin/agetty.*ttyS0.*|s1:2:respawn:/sbin/agetty -a root 115200 ttyS0 vt100|' "$ROOT_MNT/etc/inittab"
+
+# read-only root + volatile runtime dirs
+sudo tee "$ROOT_MNT/etc/fstab" <<'EOF' >/dev/null
+/dev/mmcblk0p2  /       ext4    ro,errors=remount-ro  0 1
+tmpfs           /tmp    tmpfs   defaults,noatime      0 0
+tmpfs           /run    tmpfs   defaults,noatime      0 0
+tmpfs           /var/log tmpfs  defaults,noatime      0 0
+EOF
+
+# early boot script creates runtime dirs and enforces ro root
+sudo tee "$ROOT_MNT/etc/rc.d/00-early-setup" <<'EOF' >/dev/null
+#!/bin/sh
+case "$1" in
+  start)
+    # Ensure /run is available (should be mounted via fstab)
+    mkdir -p /run/resolv /run/misc
+    # Remount root as read-only after early boot (e.g., rc.local time sync)
+    if ! mount | grep -q "on / type.* ro,"; then
+      echo "00-early-setup: Remounting root as read-only..."
+      mount -o remount,ro /
+      sync
+    fi
+    ;;
+  stop)
+    ;;
+  *)
+    echo "Usage: $0 {start|stop}"
+    exit 1
+    ;;
+esac
+EOF
+sudo chmod +x "$ROOT_MNT/etc/rc.d/00-early-setup"
+
+# update services by including 00-early-setup first, and excluding firstrun
+sudo sed -i 's/^SERVICES=.*/SERVICES=(sysklogd 00-early-setup lo net sshd crond wifi powerkey)/' "$ROOT_MNT/etc/rc.conf"
+
+# configure DNS resolution in tmpfs
+sudo ln -sf /run/resolv/resolv.conf "$ROOT_MNT/etc/resolv.conf"
+sudo sed -i 's|/etc/resolv.conf|/run/resolv/resolv.conf|' "$ROOT_MNT/etc/udhcpc.script"
+
+# add rw & ro toggle scripts for debugging/maintenance
+cat <<'EOF' | sudo tee "$ROOT_MNT/usr/local/bin/rw" >/dev/null
+#!/bin/sh
+echo "Switching root filesystem to read-write mode..."
+mount -o remount,rw /
+echo "Root is now read-write - remember to run 'ro' before shutdown!"
+EOF
+
+cat <<'EOF' | sudo tee "$ROOT_MNT/usr/local/bin/ro" >/dev/null
+#!/bin/sh
+echo "Syncing and switching root filesystem to read-only..."
+sync
+mount -o remount,ro /
+echo "Root is now read-only!"
+EOF
+sudo chmod +x "$ROOT_MNT/usr/local/bin/rw" "$ROOT_MNT/usr/local/bin/ro"
 
 echo
 echo "SSID: $WIFI_SSID"
