@@ -58,6 +58,8 @@ Fast and simple way to make your [Orange Pi RV2](http://www.orangepi.org/orangep
    sudo minicom --baudrate 115200 --device /dev/ttyUSB0
    ```
 
+1. Now all devices (as wired PC behind `eth1` LAN as all WiFi devices connected to `wlan0` via WiFi) are in one logical LAN under 192.168.10.0/24 network segment because `br0` bridge, and might be connected to each other (WiFi <-> wired, WiFi <-> WiFi, wired <-> wired).
+
    Done!
 
 ## License

@@ -13,7 +13,7 @@
 set -e
 
 # configuration
-VER=0.5.0
+VER=0.6.0
 WIFI_SSID="${WIFI_SSID:-opi}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-$(dd if=/dev/urandom bs=12 count=1 2>/dev/null | base64 | cut -c1-12)}"
 IMG_NAME="irradium-opi-router.img"
@@ -85,6 +85,24 @@ sudo chmod +x "$ROOT_MNT/usr/local/bin/"{busybox,iw,hostapd,dnsmasq,powerkey}
 sudo ln -sf busybox "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo chmod +x "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo mkdir -p "$ROOT_MNT/var/lib/misc"
+
+# install Armbian's generic BCM43455 NVRAM for Allwinner
+echo "Installing Armbian BCM43455 NVRAM for Allwinner..."
+NVRAM_FILE="brcmfmac43455-sdio.txt"
+NVRAM_URL="https://raw.githubusercontent.com/armbian/firmware/refs/heads/master/brcm/$NVRAM_FILE"
+NVRAM_DEST="$ROOT_MNT/lib/firmware/brcm"
+
+mkdir -p firmware && cd firmware >/dev/null
+
+# download firmware if missing
+if [ ! -f "$NVRAM_FILE" ]; then
+  echo "Downloading firmware..."
+  wget --quiet --no-check-certificate "$NVRAM_URL"
+fi
+
+sudo cp $NVRAM_FILE $NVRAM_DEST
+
+cd - >/dev/null
 
 # append time-sync logic
 sudo tee "$ROOT_MNT/etc/rc.local" <<'EOF' >/dev/null
@@ -188,10 +206,9 @@ case "$1" in
     # Wait for wlan0
     for i in $(seq 1 25); do
       if ip link show wlan0 >/dev/null 2>&1; then
-        echo "wifi-ap: wlan0 detected — waiting for firmware readiness..."
-        sleep 8
+        echo "wifi-ap: wlan0 detected"
         ip link set wlan0 up
-        ip addr add 192.168.12.1/24 dev wlan0 || true
+        ip link set wlan0 master br0
         break
       fi
       sleep 2
@@ -202,33 +219,28 @@ case "$1" in
       exit 1
     fi
 
-    # Configure interface
-    ip link set wlan0 up
-    ip addr add 192.168.12.1/24 dev wlan0 2>/dev/null || true
-
-    # Kill stale processes
-    killall hostapd dnsmasq 2>/dev/null || true
-    sleep 2
-
-    # Start AP and DHCP
+    # Start AP
     echo "wifi-ap: starting hostapd..."
     /usr/local/bin/hostapd -B /etc/hostapd.conf >/dev/null 2>&1
-    echo "wifi-ap: starting dnsmasq..."
-/usr/local/bin/dnsmasq \
-    --interface=wlan0 \
-    --listen-address=192.168.12.1 \
-    --bind-interfaces \
-    --dhcp-range=192.168.12.50,192.168.12.150,12h \
-    --dhcp-leasefile=/run/misc/dnsmasq.leases \
-    --dhcp-option=3,192.168.12.1 \
-    --dhcp-option=6,192.168.12.1 \
-    --no-daemon \
-    --log-queries &
+
+    # Start DHCP on bridge
+    echo "wifi-ap: starting dnsmasq on br0..."
+    /usr/local/bin/dnsmasq \
+        --interface=br0 \
+        --listen-address=192.168.10.1 \
+        --bind-interfaces \
+        --dhcp-range=192.168.10.50,192.168.10.150,12h \
+        --dhcp-leasefile=/run/misc/dnsmasq.leases \
+        --dhcp-option=3,192.168.10.1 \
+        --dhcp-option=6,192.168.10.1 \
+        --no-daemon \
+        --log-queries 2>/dev/null &
 
     echo "wifi-ap: ready"
     ;;
   stop)
     killall hostapd dnsmasq 2>/dev/null || true
+    ip link set wlan0 nomaster 2>/dev/null || true
     ip link set wlan0 down 2>/dev/null || true
     ;;
 esac
@@ -278,14 +290,17 @@ start() {
   ip addr add 127.0.0.1/8 dev lo 2>/dev/null
   ip link set lo up
 
-  # LAN (eth1)
-  ip addr add 192.168.10.1/24 dev eth1 2>/dev/null
+  # Bridge with STP off and zero forward delay
+  ip link add name br0 type bridge stp_state 0 forward_delay 0
+  ip link set eth1 master br0
+  ip addr add 192.168.10.1/24 dev br0
+  ip link set br0 up
   ip link set eth1 up
 
   # WAN (eth0)
   ip link set eth0 up
   sleep 2
-  /usr/local/bin/udhcpc -i eth0 -s /etc/udhcpc.script -t 3 -T 5 -A 3 >/dev/null 2>&1 &
+  /usr/local/bin/udhcpc -i eth0 -s /etc/udhcpc.script -O router -O dns -t 3 -T 5 -A 3 >/dev/null 2>&1 &
 
   # Enable forwarding
   echo 1 > /proc/sys/net/ipv4/ip_forward
@@ -295,7 +310,6 @@ start() {
   nft flush table inet filter
 
   # Input filter: only allow SSH from LAN, block everything from WAN
-
   # Create an 'input' chain that inspects packets destined TO the router itself
   nft add chain inet filter input '{ type filter hook input priority 0; policy drop; }'
 
@@ -305,31 +319,15 @@ start() {
   # Allow all traffic on the loopback interface (required for local services)
   nft add rule inet filter input iifname "lo" accept
 
-  # Allow DHCP requests from wired clients (UDP port 67) so they can get an IP
-  nft add rule inet filter input iifname "eth1" udp dport 67 accept
-
-  # Allow DNS queries from wired clients (UDP port 53) so they can resolve domain names
-  nft add rule inet filter input iifname "eth1" udp dport 53 accept
-
-  # Allow SSH access from wired clients (TCP port 22) for administration
-  nft add rule inet filter input iifname "eth1" tcp dport 22 accept
-
-  # Allow DHCP requests from WiFi clients (UDP port 67)
-  nft add rule inet filter input iifname "wlan0" udp dport 67 accept
-
-  # Allow DNS queries from WiFi clients (UDP port 53) — critical for Internet access
-  nft add rule inet filter input iifname "wlan0" udp dport 53 accept
-
-  # Allow SSH access from WiFi clients (TCP port 22)
-  nft add rule inet filter input iifname "wlan0" tcp dport 22 accept
+  nft add rule inet filter input iifname "br0" udp dport {67,53} accept
+  nft add rule inet filter input iifname "br0" tcp dport 22 accept
 
   # Forward chain
   nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
   nft add rule inet filter forward ct state established,related accept
-  nft add rule inet filter forward ip saddr 192.168.10.0/24 ip daddr 192.168.12.0/24 accept
-  nft add rule inet filter forward ip saddr 192.168.12.0/24 ip daddr 192.168.10.0/24 accept
-  nft add rule inet filter forward ip saddr { 192.168.10.0/24, 192.168.12.0/24 } oifname "eth0" accept
-  nft add rule inet filter forward ip saddr { 192.168.10.0/24, 192.168.12.0/24 } accept
+  nft add rule inet filter forward iifname "br0" oifname "br0" accept
+  nft add rule inet filter forward iifname "br0" oifname "eth0" accept
+  nft add rule inet filter forward iifname "eth0" oifname "br0" ct state established,related accept
 
   # Masquerade
   nft add table ip nat 2>/dev/null || true
@@ -342,8 +340,9 @@ start() {
 stop() {
   killall udhcpc hostapd dnsmasq wifi-ap 2>/dev/null || true
   ip link set eth0 down 2>/dev/null
-  ip link set eth1 down 2>/dev/null
-  ip link set wlan0 down 2>/dev/null
+  ip link set eth1 nomaster 2>/dev/null || true
+  ip link set wlan0 nomaster 2>/dev/null || true
+  ip link delete br0 2>/dev/null || true
 
   echo "Network stopped"
 }
@@ -354,6 +353,7 @@ sudo chmod +x "$ROOT_MNT/etc/rc.d/net"
 # write WiFi config
 sudo tee "$ROOT_MNT/etc/hostapd.conf" <<EOF >/dev/null
 interface=wlan0
+bridge=br0
 ssid=$WIFI_SSID
 hw_mode=g
 channel=6
@@ -363,6 +363,8 @@ wpa_passphrase=$WIFI_PASSWORD
 wpa_key_mgmt=WPA-PSK
 wpa_pairwise=TKIP
 rsn_pairwise=CCMP
+ap_isolate=0
+wpa_disable_eapol_key_retries=0
 EOF
 
 # shutdown upon short press on power on/off button
