@@ -322,6 +322,9 @@ start() {
   nft add rule inet filter input iifname "br0" udp dport {67,53} accept
   nft add rule inet filter input iifname "br0" tcp dport 22 accept
 
+  # 8081 port is opened for local network (for media streaming as `busybox httpd -f -p 8081`, etc)
+  nft add rule inet filter input iifname "br0" tcp dport 8081 accept
+
   # Forward chain
   nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
   nft add rule inet filter forward ct state established,related accept
