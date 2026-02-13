@@ -13,10 +13,10 @@
 set -e
 
 # configuration
-VER=0.6.0
+VER=0.7.0
 WIFI_SSID="${WIFI_SSID:-opi}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-$(dd if=/dev/urandom bs=12 count=1 2>/dev/null | base64 | cut -c1-12)}"
-IMG_NAME="irradium-opi-router.img"
+IMG_NAME="irradium-opi-router${VER}.img"
 ROOT_MNT="/mnt/irradium-root"
 
 echo "Building Orange Pi RV2 WiFi/wired router (v$VER)..."
@@ -322,8 +322,9 @@ start() {
   nft add rule inet filter input iifname "br0" udp dport {67,53} accept
   nft add rule inet filter input iifname "br0" tcp dport 22 accept
 
-  # 8081 port is opened for local network (for media streaming as `busybox httpd -f -p 8081`, etc)
-  nft add rule inet filter input iifname "br0" tcp dport 8081 accept
+  # both 55023 & 55025 ports are opened for using in local network (for media streaming as `busybox httpd -f -p 55023`, etc)
+  nft add rule inet filter input iifname "br0" tcp dport 55023 accept
+  nft add rule inet filter input iifname "br0" tcp dport 55025 accept
 
   # Forward chain
   nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
@@ -364,11 +365,21 @@ auth_algs=1
 wpa=2
 wpa_passphrase=$WIFI_PASSWORD
 wpa_key_mgmt=WPA-PSK
-wpa_pairwise=TKIP
+wpa_pairwise=CCMP
 rsn_pairwise=CCMP
 ap_isolate=0
 wpa_disable_eapol_key_retries=0
+ieee80211d=0
+ieee80211h=0
+beacon_int=100
+dtim_period=2
 EOF
+
+# prevent kernel from suspending SDIO
+cat <<'EOF' | sudo tee "$ROOT_MNT/etc/udev/rules.d/81-brcmfmac.rules" >/dev/null
+ACTION=="add", SUBSYSTEM=="sdio", ATTR{device}=="0x43455", ATTR{power/control}="on"
+EOF
+echo 'options brcmfmac power_save=0' | sudo tee $ROOT_MNT/etc/modprobe.d/brcmfmac.conf
 
 # shutdown upon short press on power on/off button
 cat <<'EOF' | sudo tee "$ROOT_MNT/etc/rc.d/powerkey" >/dev/null
@@ -466,6 +477,7 @@ EOF
 sudo chmod +x "$ROOT_MNT/usr/local/bin/rw" "$ROOT_MNT/usr/local/bin/ro"
 
 echo
+echo "root password: $ROOT_PASS"
 echo "SSID: $WIFI_SSID"
 echo "WiFi password: $WIFI_PASSWORD"
 echo "Gateway: 192.168.10.1"
