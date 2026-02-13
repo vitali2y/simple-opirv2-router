@@ -27,7 +27,7 @@ command -v zstd >/dev/null || { echo "zstd required"; exit 1; }
 command -v losetup >/dev/null || { echo "losetup required"; exit 1; }
 
 # check binaries
-REQUIRED_BINS=("busybox" "iw" "hostapd" "dnsmasq" "powerkey")
+REQUIRED_BINS=("busybox" "iw" "hostapd" "dnsmasq" "powerkey" "m3u8_download" "joshuto")
 for bin in "${REQUIRED_BINS[@]}"; do
   if [ ! -f "utils/$bin" ]; then
     echo "Not found required binary '$bin' in 'utils' dir!"
@@ -80,8 +80,8 @@ for pkg in "${REQUIRED_PKGS[@]}"; do
 done
 
 echo "Embedding prebuilt utils..."
-sudo cp ./utils/{busybox,iw,hostapd,dnsmasq,powerkey} "$ROOT_MNT/usr/local/bin/"
-sudo chmod +x "$ROOT_MNT/usr/local/bin/"{busybox,iw,hostapd,dnsmasq,powerkey}
+sudo cp ./utils/{busybox,iw,hostapd,dnsmasq,powerkey,m3u8_download,joshuto} "$ROOT_MNT/usr/local/bin/"
+sudo chmod +x "$ROOT_MNT/usr/local/bin/"{busybox,iw,hostapd,dnsmasq,powerkey,m3u8_download,joshuto}
 sudo ln -sf busybox "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo chmod +x "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo mkdir -p "$ROOT_MNT/var/lib/misc"
