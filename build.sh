@@ -13,7 +13,7 @@
 set -e
 
 # configuration
-VER=0.7.0
+VER=0.8.0
 WIFI_SSID="${WIFI_SSID:-opi}"
 WIFI_PASSWORD="${WIFI_PASSWORD:-$(dd if=/dev/urandom bs=12 count=1 2>/dev/null | base64 | cut -c1-12)}"
 IMG_NAME="irradium-opi-router${VER}.img"
@@ -80,8 +80,8 @@ for pkg in "${REQUIRED_PKGS[@]}"; do
 done
 
 echo "Embedding prebuilt utils..."
-sudo cp ./utils/{busybox,iw,hostapd,dnsmasq,powerkey,m3u8_download,joshuto} "$ROOT_MNT/usr/local/bin/"
-sudo chmod +x "$ROOT_MNT/usr/local/bin/"{busybox,iw,hostapd,dnsmasq,powerkey,m3u8_download,joshuto}
+sudo cp ./utils/{busybox,iw,hostapd,dnsmasq,powerkey,m3u8_download,joshuto,xd} "$ROOT_MNT/usr/local/bin/"
+sudo chmod +x "$ROOT_MNT/usr/local/bin/"{busybox,iw,hostapd,dnsmasq,powerkey,m3u8_download,joshuto,xd}
 sudo ln -sf busybox "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo chmod +x "$ROOT_MNT/usr/local/bin/udhcpc"
 sudo mkdir -p "$ROOT_MNT/var/lib/misc"
